@@ -32,7 +32,7 @@ ZSH_THEME="ztheme"
 # DISABLE_AUTO_TITLE="true"
 
 # Uncomment the following line to enable command auto-correction.
-# ENABLE_CORRECTION="true"
+ENABLE_CORRECTION="true"
 
 # Uncomment the following line to display red dots whilst waiting for completion.
 # COMPLETION_WAITING_DOTS="true"
@@ -45,7 +45,7 @@ ZSH_THEME="ztheme"
 # Uncomment the following line if you want to change the command execution time
 # stamp shown in the history command output.
 # The optional three formats: "mm/dd/yyyy"|"dd.mm.yyyy"|"yyyy-mm-dd"
-# HIST_STAMPS="mm/dd/yyyy"
+HIST_STAMPS="mm/dd/yyyy"
 
 # Would you like to use another custom folder than $ZSH/custom?
 # ZSH_CUSTOM=/path/to/new-custom-folder
@@ -54,11 +54,11 @@ ZSH_THEME="ztheme"
 # Custom plugins may be added to ~/.oh-my-zsh/custom/plugins/
 # Example format: plugins=(rails git textmate ruby lighthouse)
 # Add wisely, as too many plugins slow down shell startup.
-plugins=(git)
+plugins=(git zsh-autosuggestions)
 
 # User configuration
 
-export PATH="/usr/local/ncbi/blast/bin:/usr/local/bin/samtools-1.2:/usr/local/bin/bwa-0.7.12:/usr/local/bin/HDMan:/Users/zeleznick/bioe131:/usr/local/bin/csslint:/usr/local/bin/jsxhint:/Applications/MAMP/bin/php/php5.4.26/bin:/usr/local/bin/python:/usr/local/bin/ipython:/usr/local/bin:/Users/zeleznick/.rvm/gems/ruby-2.0.0-p481@railstutorial_rails_4_0/bin:/Users/zeleznick/.rvm/gems/ruby-2.0.0-p481@global/bin:/Users/zeleznick/.rvm/rubies/ruby-2.0.0-p481/bin:/Users/zeleznick/CS194/hacks/meals/menuparser.py:/Applications/MAMP/bin/php/php5.4.26/bin:/Users/zeleznick/wine/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/X11/bin:/usr/local/ncbi/blast/bin:/usr/texbin:/Users/zeleznick/.rvm/bin"
+export PATH="/usr/local/ncbi/blast/bin:/usr/local/bin/samtools-1.2:/usr/local/bin/bwa-0.7.12:/usr/local/bin/HDMan:/Users/zeleznick/bioe131:/usr/local/bin/csslint:/usr/local/bin/jsxhint:/Applications/MAMP/bin/php/php5.4.26/bin:/usr/local/bin/python:/usr/local/bin/ipython:/usr/local/bin:/Users/zeleznick/.rvm/gems/ruby-2.0.0-p481@railstutorial_rails_4_0/bin:/Users/zeleznick/.rvm/gems/ruby-2.0.0-p481@global/bin:/Users/zeleznick/.rvm/rubies/ruby-2.0.0-p481/bin:/Users/zeleznick/CS194/hacks/meals/menuparser.py:/Applications/MAMP/bin/php/php5.4.26/bin:/Users/zeleznick/wine/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/X11/bin:/usr/local/ncbi/blast/bin:/usr/texbin:/Users/zeleznick/.rvm/bin:/usr/local/sbin"
 # export MANPATH="/usr/local/man:$MANPATH"
 
 source $ZSH/oh-my-zsh.sh
@@ -111,7 +111,7 @@ alias activate='source .env/bin/activate; source .env/bin/postactivate'
 alias freeze='pip freeze > requirements.txt'
 
 # E X T E R N A L  U T I L S
-alias ip="curl icanhazip.com" # Your public IP address
+alias myip="curl icanhazip.com" # Your public IP address
 alias yt='cd $HOME/downloads; youtube-dl --verbose'
 alias glog='git log --oneline --decorate --color --graph'
 # ruby gem for wifi password
@@ -137,6 +137,7 @@ alias prog="~/config/progress.py"
 
 alias tasks="python ~/tasker/code/tasker.py"
 alias maze="python ~/python-projects/Maze/main.py"
+alias menu="python3 ~/feedBot/heroku_main/menu.py"
 
 
 # D I R E C T O R I ES
@@ -150,3 +151,16 @@ source ~/.oh-my-zsh/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
 
 # added by travis gem
 [ -f /Users/zeleznick/.travis/travis.sh ] && source /Users/zeleznick/.travis/travis.sh
+
+# Torch installation
+. /Users/zeleznick/torch/install/bin/torch-activate
+
+# The next line updates PATH for the Google Cloud SDK.
+if [ -f /Users/zeleznick/google-cloud-sdk/path.zsh.inc ]; then
+  source '/Users/zeleznick/google-cloud-sdk/path.zsh.inc'
+fi
+
+# The next line enables shell command completion for gcloud.
+if [ -f /Users/zeleznick/google-cloud-sdk/completion.zsh.inc ]; then
+  source '/Users/zeleznick/google-cloud-sdk/completion.zsh.inc'
+fi
