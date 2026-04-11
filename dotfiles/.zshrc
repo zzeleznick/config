@@ -72,6 +72,13 @@ alias gstp="git stash pop"
 alias c="code ."
 alias zshrc="code ~/.zshrc"
 alias zshup="source ~/.zshrc"
+function aliases {
+  if [[ "$1" == "-v" ]]; then
+    alias | sort | column -t -s '='
+  else
+    grep "^alias " ~/.zshrc | sed 's/^alias //' | sort | column -t -s '='
+  fi
+}
 
 # ======================
 # Utilities
