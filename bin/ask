@@ -1,0 +1,20 @@
+#!/bin/zsh
+# ask — query Claude from the command line
+# Usage: ask "what is a monad"
+#        pressure | ask "is this healthy?"
+#        cat error.log | ask
+
+local input=""
+if [[ ! -t 0 ]]; then
+  input="$(cat)"
+fi
+
+local prompt="${*:-Analyze this and give a concise answer.}"
+local full="${input:+${input}\n\n}${prompt}"
+
+if command -v spin &>/dev/null; then
+  spin "Asking Claude..." sh -c "echo $(printf '%q' "$full") | claude -p --no-session-persistence --allowedTools ''"
+else
+  echo "Asking Claude..."
+  echo "$full" | claude -p --no-session-persistence --allowedTools ''
+fi

@@ -1,0 +1,29 @@
+#!/bin/zsh
+# spin — run a command with an animated spinner
+# Usage: spin "Loading..." command --with-args
+#        spin command --with-args  (uses "Working..." as default message)
+
+local msg="Working..."
+if [[ $# -gt 1 && "$1" != -* && ! -x "$(command -v "$1" 2>/dev/null)" ]]; then
+  msg="$1"; shift
+fi
+
+local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+local tmpfile=$(mktemp)
+
+"$@" > "$tmpfile" 2>&1 &
+local pid=$!
+local i=0
+
+while kill -0 $pid 2>/dev/null; do
+  printf "\r\033[36m${frames[$((i % 10 + 1))]}\033[0m %s" "$msg"
+  sleep 0.1
+  ((i++))
+done
+
+wait $pid
+local rc=$?
+printf "\r\033[K"
+cat "$tmpfile"
+rm -f "$tmpfile"
+return $rc
