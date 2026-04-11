@@ -94,6 +94,28 @@ alias pressure="top -l1 -n0 | grep -E 'CPU|PhysMem|Processes'; sysctl vm.swapusa
 alias hg="history | rg"
 
 # ======================
+# Claude Code
+# ======================
+alias clc="claude --continue"
+alias clf="claude --continue --fork-session"
+cs() {
+  local proj_dir="$HOME/.claude/projects/-$(pwd | tr '/' '-' | sed 's/^-//')"
+  if [[ ! -d "$proj_dir" ]]; then
+    echo "No Claude sessions found for $(pwd)" >&2
+    return 1
+  fi
+  local latest
+  latest=$(ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1)
+  if [[ -z "$latest" ]]; then
+    echo "No session files found in $proj_dir" >&2
+    return 1
+  fi
+  local session_id
+  session_id=$(basename "$latest" .jsonl)
+  echo "$session_id"
+}
+
+# ======================
 # Functions (require ~/.local/bin: spin, ask)
 # ======================
 function checkup { pressure | ask "One-paragraph plain English diagnosis. Is the machine healthy? What is the bottleneck if any? Skip the fluff."; }
