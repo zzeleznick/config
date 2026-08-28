@@ -1,0 +1,359 @@
+#!/bin/zsh
+# stale — find and clean up orphaned dev processes and containers
+# Usage: stale                    scan and report (read-only, default)
+#        stale --clean            report, then stop/kill after confirming
+#        stale --prune            also remove the orphaned stacks' containers
+#        stale --clean --yes      clean without prompting
+#        stale --hours 8          idle-browser age threshold (default 4)
+#        stale --restarts 50      crash-loop threshold (default 20)
+#
+# Finds five things:
+#   1. processes whose working directory no longer exists (deleted worktrees)
+#   2. processes waiting on a dev port that nothing is listening on any more
+#   3. headless browsers left running past the age threshold
+#   4. container stacks whose project directory is gone
+#   5. containers stuck in a restart loop
+#
+# --clean stops containers, it never removes them, so volumes survive and any
+# stack can be brought back with `docker start` or its own tooling.
+#
+# --prune additionally removes containers, but only for the stacks proven
+# orphaned above — never a blanket `docker container prune`, which would also
+# take stacks that happen to be stopped right now. Volumes are never deleted:
+# a stopped container is what keeps its named volume out of the "dangling"
+# bucket, so --prune reports which volumes it just left unprotected. Reclaiming
+# image and volume space stays manual.
+#
+# Tune without editing: STALE_PROC_PATTERN, STALE_BROWSER_EXCLUDE,
+# STALE_WORKDIR_LABELS.
+
+emulate -L zsh
+setopt local_options pipefail
+
+typeset -i CLEAN=0 PRUNE=0 ASSUME_YES=0 AGE_HOURS=4 RESTART_LIMIT=20
+
+while (( $# )); do
+  case "$1" in
+    --clean)    CLEAN=1 ;;
+    --prune)    CLEAN=1; PRUNE=1 ;;   # pruning requires stopping first
+    --yes|-y)   ASSUME_YES=1 ;;
+    --hours)    shift; AGE_HOURS=$1 ;;
+    --restarts) shift; RESTART_LIMIT=$1 ;;
+    -h|--help)  grep -E '^# ' "$0" | cut -c3-; exit 0 ;;
+    *) print -u2 "stale: unknown option $1"; exit 2 ;;
+  esac
+  shift
+done
+
+# Long-running processes that represent dev work rather than an app you use.
+: ${STALE_PROC_PATTERN:='node|vite|esbuild|storybook|webpack|rollup|jest|vitest|karma|next-server|chrome-headless-shell'}
+# Electron apps embed Chromium and would otherwise look like headless browsers.
+: ${STALE_BROWSER_EXCLUDE:='Electron Framework|Code Helper|Visual Studio Code|Slack|Discord|Loom|Claude.app|Notion'}
+# Labels that record the directory a container stack was created from.
+: ${STALE_WORKDIR_LABELS:='com.docker.compose.project.working_dir com.supabase.cli.workdir'}
+
+typeset -a KILL_PIDS STOP_PROJECTS
+KILL_PIDS=(); STOP_PROJECTS=()
+
+dim()   { print -n "\033[2m$1\033[0m" }
+head2() { print "\n\033[1m$1\033[0m" }
+
+# ---------------------------------------------------------------- context ---
+# Pressure first. Idle processes contribute nothing to load average, so this
+# tells you whether the machine is CPU-bound or memory-bound before you start
+# attributing any improvement to the cleanup.
+show_context() {
+  local total_gb free_mb swap used_mb
+  head2 "System"
+  total_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+  free_mb=$(vm_stat | awk '/Pages free/ {printf "%.0f", $3 * 16384 / 1048576}')
+  swap=$(sysctl -n vm.swapusage | sed 's/  */ /g')
+  print "  load     $(uptime | sed 's/.*load averages*: //')"
+  print "  memory   ${total_gb} GB total, ${free_mb} MB free"
+  print "  swap     ${swap}"
+  used_mb=$(sysctl -n vm.swapusage | sed -n 's/.*used = \([0-9]*\).*/\1/p')
+  if [[ -n "$used_mb" ]] && (( used_mb > 4096 )); then
+    print "  \033[33m! heavy swap use — memory-bound; killing idle procs frees RAM, not CPU\033[0m"
+  fi
+}
+
+# macOS ps cannot report a working directory; lsof can.
+proc_cwd() { lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1 }
+
+# A real headless browser, not an Electron app that merely bundles Chromium.
+is_headless_browser() {
+  local cmd=$1
+  [[ "$cmd" =~ ($STALE_BROWSER_EXCLUDE) ]] && return 1
+  [[ "$cmd" == *chrome-headless-shell* ]] && return 0
+  [[ "$cmd" == *--headless* ]] && return 0
+  [[ "$cmd" == *playwright*profile* ]] && return 0
+  [[ "$cmd" == *puppeteer_dev* ]] && return 0
+  return 1
+}
+
+# Poll for up to `tries` * 0.1s and echo whichever PIDs are still running.
+still_alive() {
+  local -i tries=$1 i p
+  shift
+  local -a pids alive
+  pids=("$@")
+  for (( i = 0; i < tries; i++ )); do
+    alive=()
+    for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && alive+=("$p"); done
+    (( ${#alive} == 0 )) && return 0
+    pids=("${alive[@]}")
+    sleep 0.1
+  done
+  print -r -- "${alive[@]}"
+}
+
+# Compare an elapsed-time field ([[dd-]hh:]mm:ss) against an hour threshold.
+older_than() {
+  local et=$1 days=0 hours=0
+  local -i limit_h=$2
+  local -a parts
+  [[ "$et" == *-* ]] && { days=${et%%-*}; et=${et#*-} }
+  parts=(${(s.:.)et})
+  case ${#parts} in
+    3) hours=${parts[1]} ;;
+    2) hours=0 ;;
+    *) return 1 ;;
+  esac
+  (( (10#$days * 24 + 10#$hours) >= limit_h ))
+}
+
+# --------------------------------------------------------------- processes ---
+scan_processes() {
+  # Declared once, outside the loops: in zsh a bare `local x` on an
+  # already-declared local prints "x=value" instead of staying quiet.
+  local line pid etime cmd cwd reason port
+  local -i found=0
+  local -a candidates
+
+  head2 "Processes"
+  candidates=(${(f)"$(ps -Ao pid=,etime=,command= | grep -E "$STALE_PROC_PATTERN|--headless" | grep -v grep)"})
+
+  for line in $candidates; do
+    pid=${${line## }%% *}
+    [[ -z "$pid" ]] && continue
+    cmd=$(ps -o command= -p "$pid" 2>/dev/null) || continue
+    [[ -z "$cmd" ]] && continue
+    etime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+    reason=""
+
+    # Deleted worktree — the strongest signal, and always safe to act on.
+    cwd=$(proc_cwd "$pid")
+    if [[ -n "$cwd" && ! -d "$cwd" ]]; then
+      reason="working dir gone: $cwd"
+    elif is_headless_browser "$cmd" && older_than "$etime" "$AGE_HOURS"; then
+      reason="headless browser idle ${etime}"
+    else
+      # A process pinned to a port with no listener left: a screenshot or smoke
+      # run whose server exited out from under it.
+      port=$(print -r -- "$cmd" | grep -oE '(127\.0\.0\.1|localhost):[0-9]+' | head -1 | cut -d: -f2)
+      if [[ -n "$port" ]] && ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        reason="waiting on dead port $port"
+      fi
+    fi
+
+    if [[ -n "$reason" ]]; then
+      printf '  %-8s %-13s %s\n' "$pid" "$etime" "$reason"
+      dim "           ${cmd:0:96}\n"
+      KILL_PIDS+=("$pid"); (( found++ ))
+    fi
+  done
+
+  (( found )) || print "  none"
+}
+
+# -------------------------------------------------------------- containers ---
+scan_containers() {
+  local proj cid workdir key row name restarts exitcode restarting last
+  local -i found=0 n running
+  local -a projects rows
+
+  command -v docker >/dev/null 2>&1 || return 0
+  if ! docker info >/dev/null 2>&1; then
+    head2 "Containers"; print "  docker not responding — skipped"; return 0
+  fi
+
+  head2 "Container stacks"
+  # Include stopped containers: an orphaned stack stays orphaned after --clean
+  # stops it, and you still want --prune to be able to reclaim it later.
+  projects=(${(f)"$(docker ps -a --format '{{.Label "com.docker.compose.project"}}' | sort -u | grep -v '^$')"})
+  for proj in $projects; do
+    cid=$(docker ps -aq --filter "label=com.docker.compose.project=$proj" | head -1)
+    [[ -z "$cid" ]] && continue
+    workdir=""
+    for key in ${=STALE_WORKDIR_LABELS}; do
+      workdir=$(docker inspect "$cid" --format "{{index .Config.Labels \"$key\"}}" 2>/dev/null)
+      [[ -n "$workdir" ]] && break
+    done
+    n=$(docker ps -aq --filter "label=com.docker.compose.project=$proj" | wc -l | tr -d ' ')
+    running=$(docker ps -q --filter "label=com.docker.compose.project=$proj" | wc -l | tr -d ' ')
+    # Test the full recorded path, not just its parent: a workspace can still
+    # exist while the specific stack directory inside it has been removed.
+    if [[ -n "$workdir" && ! -d "$workdir" ]]; then
+      printf '  %-42s %2s containers (%s running)  source gone\n' "$proj" "$n" "$running"
+      dim "    $workdir\n"
+      STOP_PROJECTS+=("$proj"); (( found++ ))
+    fi
+  done
+  (( found )) || print "  none orphaned"
+
+  head2 "Crash loops"
+  found=0
+  # One inspect call for every container beats three calls per container.
+  rows=(${(f)"$(docker ps -a --format '{{.Names}}' \
+    | xargs -r docker inspect --format '{{.Name}}|{{.RestartCount}}|{{.State.ExitCode}}|{{.State.Restarting}}' 2>/dev/null)"})
+  for row in $rows; do
+    name=${${row%%|*}#/}
+    restarts=${${row#*|}%%|*}
+    exitcode=${${row#*|*|}%%|*}
+    restarting=${row##*|}
+    if [[ "$restarting" == "true" ]] || (( restarts >= RESTART_LIMIT )); then
+      printf '  %-40s %6s restarts  exit=%s\n' "$name" "$restarts" "$exitcode"
+      # The last log line is nearly always the entire diagnosis.
+      last=$(docker logs --tail 1 "$name" 2>&1 | tr -d '\r' | head -1)
+      [[ -n "$last" ]] && dim "    ${last:0:96}\n"
+      (( found++ ))
+    fi
+  done
+  if (( found )); then
+    print "\n  A restart loop never resolves on its own. Fix the cause, or stop it:"
+    dim "    docker update --restart=no NAME && docker stop NAME\n"
+  else
+    print "  none"
+  fi
+}
+
+# -------------------------------------------------------------------- disk ---
+# Report only. Reclaiming image and volume space is deliberately left to you:
+# volumes hold data and images are slow to re-pull.
+show_disk() {
+  local line kind reclaimable
+  command -v docker >/dev/null 2>&1 || return 0
+  docker info >/dev/null 2>&1 || return 0
+
+  head2 "Disk"
+  # Use docker's own formatter: the plain table has two-word type names
+  # ("Local Volumes", "Build Cache") that break naive column splitting.
+  docker system df --format '{{.Type}}|{{.Size}}|{{.Reclaimable}}' 2>/dev/null \
+    | while IFS='|' read -r kind size reclaimable; do
+        printf '  %-15s %-10s reclaimable %s\n' "$kind" "$size" "$reclaimable"
+      done
+
+  print "\n  Reclaim deliberately — these are not part of --clean or --prune:"
+  dim "    docker image prune -a        # unused images; slow to re-pull\n"
+  dim "    docker builder prune         # build cache\n"
+  dim "    docker volume ls -f dangling=true   # REVIEW before removing — volumes hold data\n"
+}
+
+# A stopped container is the only thing keeping its named volume out of the
+# "dangling" bucket. Removing containers therefore makes a later
+# `docker volume prune` destructive in a way it was not a moment earlier.
+warn_newly_dangling() {
+  local -a before after newly
+  before=("$@")
+  after=(${(f)"$(docker volume ls -qf dangling=true 2>/dev/null)"})
+  newly=(${after:|before})
+  (( ${#newly} )) || return 0
+  print "\n  \033[33m! ${#newly} volume(s) are now dangling and no longer protected by a container:\033[0m"
+  local v size
+  for v in "${newly[@]}"; do
+    size=$(docker system df -v 2>/dev/null | awk -v n="$v" '$1 == n {print $NF}')
+    printf '      %-60s %s\n' "$v" "${size:-?}"
+  done
+  print "    They still hold data. Review before any \033[1mdocker volume prune\033[0m."
+}
+
+# ------------------------------------------------------------------ action ---
+do_clean() {
+  local reply proj p
+  local -a survivors
+  local -i remaining=0 still=0
+
+  if (( ${#KILL_PIDS} + ${#STOP_PROJECTS} == 0 )); then
+    print "\nNothing to clean."; return 0
+  fi
+
+  print ""
+  print "\033[1mWill terminate ${#KILL_PIDS} process(es) and stop ${#STOP_PROJECTS} stack(s).\033[0m"
+  if (( PRUNE )); then
+    print "Then \033[1mremove\033[0m those stacks' containers — only the ones proven orphaned above."
+    print "Named volumes are never deleted, but removing containers leaves them dangling."
+  else
+    print "Containers are stopped, not removed — volumes are preserved."
+  fi
+  if (( ! ASSUME_YES )); then
+    print -n "Proceed? [y/N] "
+    read -r reply
+    [[ "$reply" == [yY]* ]] || { print "Aborted."; return 1 }
+  fi
+
+  if (( ${#KILL_PIDS} )); then
+    print "\nTerminating processes..."
+    # zsh does not word-split unquoted parameters, so `kill $VAR` would pass one
+    # mangled argument and silently do nothing. Always expand a real array.
+    kill -TERM "${KILL_PIDS[@]}" 2>/dev/null
+    # Signals are asynchronous. Checking immediately reports a live process that
+    # is merely mid-exit, so give SIGTERM a grace period before escalating.
+    survivors=($(still_alive 15 "${KILL_PIDS[@]}"))
+    if (( ${#survivors} )); then
+      print "  ${#survivors} ignored SIGTERM, sending SIGKILL"
+      kill -9 "${survivors[@]}" 2>/dev/null
+      survivors=($(still_alive 10 "${survivors[@]}"))
+    fi
+    remaining=${#survivors}
+    print "  $(( ${#KILL_PIDS} - remaining ))/${#KILL_PIDS} terminated"
+    (( remaining )) && print "  still alive: ${survivors[*]}"
+  fi
+
+  if (( ${#STOP_PROJECTS} )); then
+    print "\nStopping stacks..."
+    for proj in "${STOP_PROJECTS[@]}"; do
+      docker ps -q --filter "label=com.docker.compose.project=$proj" | xargs -r docker stop >/dev/null 2>&1
+      # Confirm from live state: `docker stop` exits 0 even when its argument
+      # list was malformed, so a zero status proves nothing.
+      still=$(docker ps -q --filter "label=com.docker.compose.project=$proj" | wc -l | tr -d ' ')
+      if (( still == 0 )); then
+        printf '  %-42s stopped\n' "$proj"
+      else
+        printf '  %-42s %s still up — check manually\n' "$proj" "$still"
+      fi
+    done
+
+    if (( PRUNE )); then
+      # Snapshot dangling volumes first so we can report what removal exposed.
+      local -a dangling_before
+      dangling_before=(${(f)"$(docker volume ls -qf dangling=true 2>/dev/null)"})
+
+      print "\nRemoving containers for orphaned stacks..."
+      local -i removed=0 gone
+      for proj in "${STOP_PROJECTS[@]}"; do
+        # Scoped by compose project label: a blanket `docker container prune`
+        # would also take unrelated stacks that are merely stopped right now.
+        gone=$(docker ps -aq --filter "label=com.docker.compose.project=$proj" \
+               | xargs -r docker rm -v 2>/dev/null | wc -l | tr -d ' ')
+        printf '  %-42s removed %s\n' "$proj" "$gone"
+        (( removed += gone ))
+      done
+      print "  $removed container(s) removed"
+      warn_newly_dangling "${dangling_before[@]}"
+    fi
+  fi
+
+  print ""
+  show_context
+}
+
+show_context
+scan_processes
+scan_containers
+show_disk
+
+if (( CLEAN )); then
+  do_clean
+elif (( ${#KILL_PIDS} + ${#STOP_PROJECTS} )); then
+  print "\nRun \033[1mstale --clean\033[0m to terminate these."
+fi
